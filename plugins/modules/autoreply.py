@@ -1,15 +1,20 @@
 """
-AutoReply Module - FINAL VERSION
+AutoReply Module - CHANNEL TARGET VERSION
 Telethon + MongoDB
 
+Concept:
+- Target = CHANNEL ID
+- Bot monitor discussion groups
+- Hanya reply kalau forwarded post berasal dari channel target
+- Forward random user tidak akan kena
+
 Features:
-- Monitor discussion group linked channel
-- Auto reply by keyword
-- Multiple wording match
-- Separate replies
+- Target channel
+- Multi keyword
+- Multi reply
 - Interactive add wording
-- Auto delete wording after limit reached
-- Send report to Saved Messages
+- Auto delete after limit
+- Report to Saved Messages
 - Anti duplicate
 - Full logging
 """
@@ -34,9 +39,13 @@ class AutoReply:
         self.userbot_id = None
         self.userbot_username = None
 
-        self.autoreply_groups = []
+        # TARGET CHANNELS
+        self.target_channels = []
+
+        # WORDINGS
         self.wordings = {}
 
+        # INTERACTIVE
         self.pending_inputs = {}
 
     # =====================================================
@@ -58,15 +67,15 @@ class AutoReply:
 
         logger.info("[LOAD CONFIG]")
 
-        groups = await self.db.autoreply_groups.find(
+        channels = await self.db.autoreply_channels.find(
             {
                 "userbot_id": self.userbot_id
             }
         ).to_list(None)
 
-        self.autoreply_groups = [
-            str(g["group_id"])
-            for g in groups
+        self.target_channels = [
+            str(c["channel_id"]).replace("-100", "")
+            for c in channels
         ]
 
         wordings = await self.db.wordings.find(
@@ -79,68 +88,118 @@ class AutoReply:
 
         logger.info(
             f"[CONFIG LOADED] "
-            f"groups={len(groups)} "
+            f"channels={len(channels)} "
             f"wordings={len(wordings)}"
         )
 
     # =====================================================
-    # DATABASE
+    # CHANNEL DATABASE
     # =====================================================
 
-    async def save_group(self, group_id):
+    async def save_channel(self, channel_input):
 
-        await self.db.autoreply_groups.update_one(
-            {
-                "group_id": str(group_id),
-                "userbot_id": self.userbot_id
-            },
-            {
-                "$set": {
-                    "group_id": str(group_id),
-                    "userbot_id": self.userbot_id,
-                    "created_at": datetime.now()
-                }
-            },
-            upsert=True
-        )
+        try:
 
-        if str(group_id) not in self.autoreply_groups:
-            self.autoreply_groups.append(
-                str(group_id)
+            # username
+            if channel_input.startswith("@"):
+
+                entity = await self.client.get_entity(
+                    channel_input
+                )
+
+                channel_id = str(entity.id)
+
+                channel_name = getattr(
+                    entity,
+                    "title",
+                    channel_input
+                )
+
+            else:
+
+                channel_id = (
+                    str(channel_input)
+                    .replace("-100", "")
+                )
+
+                entity = await self.client.get_entity(
+                    int(channel_input)
+                )
+
+                channel_name = getattr(
+                    entity,
+                    "title",
+                    channel_input
+                )
+
+            await self.db.autoreply_channels.update_one(
+                {
+                    "channel_id": channel_id,
+                    "userbot_id": self.userbot_id
+                },
+                {
+                    "$set": {
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "userbot_id": self.userbot_id,
+                        "created_at": datetime.now()
+                    }
+                },
+                upsert=True
             )
 
-        logger.info(
-            f"[GROUP SAVED] {group_id}"
+            if channel_id not in self.target_channels:
+                self.target_channels.append(
+                    channel_id
+                )
+
+            logger.info(
+                f"[CHANNEL SAVED] {channel_id}"
+            )
+
+            return True, channel_name
+
+        except Exception as e:
+
+            logger.exception(e)
+
+            return False, str(e)
+
+    async def delete_channel(self, channel_id):
+
+        channel_id = (
+            str(channel_id)
+            .replace("-100", "")
         )
 
-        return True
-
-    async def delete_group(self, group_id):
-
-        result = await self.db.autoreply_groups.delete_one(
+        result = await self.db.autoreply_channels.delete_one(
             {
-                "group_id": str(group_id),
+                "channel_id": channel_id,
                 "userbot_id": self.userbot_id
             }
         )
 
-        if str(group_id) in self.autoreply_groups:
-            self.autoreply_groups.remove(
-                str(group_id)
+        if channel_id in self.target_channels:
+
+            self.target_channels.remove(
+                channel_id
             )
 
         logger.info(
-            f"[GROUP DELETED] {group_id}"
+            f"[CHANNEL DELETED] {channel_id}"
         )
 
         return result.deleted_count > 0
+
+    # =====================================================
+    # WORDINGS
+    # =====================================================
 
     async def save_wording(
         self,
         jumlah,
         keyword,
-        pesan,
-        group_id="all"
+        pesan
     ):
 
         data = {
@@ -149,7 +208,6 @@ class AutoReply:
             "send_count": 0,
             "keyword": keyword.lower(),
             "message": pesan,
-            "group_id": str(group_id),
             "active": True,
             "created_at": datetime.now()
         }
@@ -169,8 +227,7 @@ class AutoReply:
 
         logger.info(
             f"[WORDING SAVED] "
-            f"id={result.inserted_id} "
-            f"keyword={keyword}"
+            f"{keyword}"
         )
 
         return True, str(result.inserted_id)
@@ -194,15 +251,39 @@ class AutoReply:
                 if str(w["_id"]) != str(wording_id)
             ]
 
-        logger.info(
-            f"[WORDING DELETED] {wording_id}"
-        )
-
         return result.deleted_count > 0
 
     # =====================================================
     # LISTS
     # =====================================================
+
+    async def list_channels(self):
+
+        channels = await self.db.autoreply_channels.find(
+            {
+                "userbot_id": self.userbot_id
+            }
+        ).to_list(None)
+
+        if not channels:
+
+            return (
+                "❌ Belum ada target channel.\n\n"
+                "Gunakan:\n"
+                "<code>/add_channel @channel</code>"
+            )
+
+        text = "<b>📋 TARGET CHANNEL</b>\n\n"
+
+        for i, ch in enumerate(channels, start=1):
+
+            text += (
+                f"<b>{i}.</b> "
+                f"{ch.get('channel_name', 'Unknown')}\n"
+                f"<code>{ch['channel_id']}</code>\n\n"
+            )
+
+        return text
 
     async def list_wordings(self):
 
@@ -222,47 +303,6 @@ class AutoReply:
                 f"🔑 Keyword: <code>{w['keyword']}</code>\n"
                 f"💬 Pesan: <code>{w['message'][:50]}</code>\n"
                 f"📦 Limit: {w['send_count']}/{w['jumlah']}\n"
-            )
-
-        return text
-
-    async def list_autoreply_groups(self):
-
-        if not self.autoreply_groups:
-
-            return (
-                "❌ Belum ada target.\n\n"
-                "Gunakan:\n"
-                "<code>/add_autoreply -100xxxx</code>"
-            )
-
-        text = "<b>📋 TARGET AUTOREPLY</b>\n\n"
-
-        for i, group_id in enumerate(
-            self.autoreply_groups,
-            start=1
-        ):
-
-            name = "Unknown"
-
-            try:
-
-                entity = await self.client.get_entity(
-                    int(group_id)
-                )
-
-                name = getattr(
-                    entity,
-                    "title",
-                    "Unknown"
-                )
-
-            except:
-                pass
-
-            text += (
-                f"<b>{i}.</b> {name}\n"
-                f"<code>{group_id}</code>\n\n"
             )
 
         return text
@@ -290,72 +330,73 @@ class AutoReply:
             command = args[0][1:].lower()
 
             # =============================================
-            # ADD GROUP
+            # ADD CHANNEL
             # =============================================
 
-            if command == "add_autoreply":
+            if command == "add_channel":
 
                 if len(args) < 2:
 
                     await event.reply(
-                        "/add_autoreply -100xxxx"
+                        "/add_channel @channel"
                     )
 
                     return
 
-                group_id = args[1]
-
-                success = await self.save_group(
-                    group_id
+                success, result = await self.save_channel(
+                    args[1]
                 )
 
                 if success:
 
                     await event.reply(
-                        f"✅ Group ditambahkan\n"
-                        f"<code>{group_id}</code>"
+                        f"✅ Channel ditambahkan\n"
+                        f"<code>{result}</code>"
+                    )
+
+                else:
+
+                    await event.reply(
+                        f"❌ Gagal\n{result}"
                     )
 
                 return
 
             # =============================================
-            # DELETE GROUP
+            # DELETE CHANNEL
             # =============================================
 
-            if command == "del_autoreply":
+            if command == "del_channel":
 
                 if len(args) < 2:
 
                     await event.reply(
-                        "/del_autoreply -100xxxx"
+                        "/del_channel channel_id"
                     )
 
                     return
 
-                group_id = args[1]
-
-                success = await self.delete_group(
-                    group_id
+                success = await self.delete_channel(
+                    args[1]
                 )
 
                 if success:
 
                     await event.reply(
-                        f"✅ Group dihapus\n"
-                        f"<code>{group_id}</code>"
+                        "✅ Channel dihapus"
                     )
 
                 return
 
             # =============================================
-            # LIST GROUP
+            # LIST CHANNEL
             # =============================================
 
-            if command == "list_autoreply":
+            if command == "list_channel":
 
                 await self.load_config()
 
-                result = await self.list_autoreply_groups()
+                result = await self.list_channels()
 
                 await event.reply(result)
 
@@ -372,8 +413,7 @@ class AutoReply:
                 }
 
                 await event.reply(
-                    "📦 Berapa kali auto reply dikirim?\n\n"
-                    "Ketik angka."
+                    "📦 Berapa kali auto reply dikirim?"
                 )
 
                 return
@@ -399,11 +439,6 @@ class AutoReply:
             if command == "delwording":
 
                 if len(args) < 2:
-
-                    await event.reply(
-                        "/delwording nomor"
-                    )
-
                     return
 
                 try:
@@ -412,10 +447,6 @@ class AutoReply:
 
                 except:
 
-                    await event.reply(
-                        "❌ Nomor harus angka"
-                    )
-
                     return
 
                 uid = str(self.userbot_id)
@@ -423,11 +454,6 @@ class AutoReply:
                 wordings = self.wordings.get(uid, [])
 
                 if nomor < 1 or nomor > len(wordings):
-
-                    await event.reply(
-                        "❌ Nomor tidak valid"
-                    )
-
                     return
 
                 wording = wordings[nomor - 1]
@@ -453,25 +479,23 @@ class AutoReply:
                 help_text = """
 <b>📖 COMMAND LIST</b>
 
-<b>GROUP TARGET</b>
-<code>/add_autoreply -100xxxx</code>
-<code>/del_autoreply -100xxxx</code>
-<code>/list_autoreply</code>
+<b>CHANNEL TARGET</b>
+<code>/add_channel @channel</code>
+<code>/del_channel channel_id</code>
+<code>/list_channel</code>
 
 <b>WORDING</b>
 <code>/addwording</code>
 <code>/list_wording</code>
 <code>/delwording nomor</code>
 
-<b>INTERACTIVE</b>
-<code>cancel</code> → batalkan input
-
 <b>INFO</b>
-• Auto reply khusus forwarded channel post
-• Bisa multi keyword
-• Bisa multi reply
+• Monitor linked discussion group
+• Hanya post asli dari channel target
+• Forward random user tidak kena
+• Multi keyword
+• Multi reply
 • Auto delete setelah limit
-• Auto report ke Saved Messages
                 """
 
                 await event.reply(
@@ -482,7 +506,7 @@ class AutoReply:
                 return
 
         # =================================================
-        # INTERACTIVE HANDLER
+        # INTERACTIVE
         # =================================================
 
         @self.client.on(events.NewMessage(outgoing=True))
@@ -500,22 +524,6 @@ class AutoReply:
 
             data = self.pending_inputs[sender_id]
 
-            # cancel
-
-            if text.lower() == "cancel":
-
-                del self.pending_inputs[sender_id]
-
-                await event.reply(
-                    "❌ Dibatalkan"
-                )
-
-                return
-
-            # =============================================
-            # STEP JUMLAH
-            # =============================================
-
             if data["step"] == "jumlah":
 
                 if not text.isdigit():
@@ -531,16 +539,10 @@ class AutoReply:
                 data["step"] = "keyword"
 
                 await event.reply(
-                    "🔑 Masukkan keyword\n\n"
-                    "Contoh:\n"
-                    "<code>btc,eth,sol</code>"
+                    "🔑 Masukkan keyword"
                 )
 
                 return
-
-            # =============================================
-            # STEP KEYWORD
-            # =============================================
 
             if data["step"] == "keyword":
 
@@ -549,23 +551,17 @@ class AutoReply:
                 data["step"] = "message"
 
                 await event.reply(
-                    "💬 Masukkan pesan auto reply"
+                    "💬 Masukkan pesan"
                 )
 
                 return
 
-            # =============================================
-            # STEP MESSAGE
-            # =============================================
-
             if data["step"] == "message":
-
-                data["message"] = text
 
                 success, result = await self.save_wording(
                     jumlah=data["jumlah"],
                     keyword=data["keyword"],
-                    pesan=data["message"]
+                    pesan=text
                 )
 
                 del self.pending_inputs[sender_id]
@@ -573,22 +569,17 @@ class AutoReply:
                 if success:
 
                     await event.reply(
-                        "✅ Wording berhasil ditambahkan\n\n"
-                        f"📦 Jumlah: {data['jumlah']}\n"
-                        f"🔑 Keyword: {data['keyword']}\n"
-                        f"💬 Pesan: {data['message']}"
+                        "✅ Wording berhasil ditambahkan"
                     )
 
                 else:
 
                     await event.reply(
-                        f"❌ Gagal\n{result}"
+                        f"❌ {result}"
                     )
 
-                return
-
         # =================================================
-        # AUTOREPLY HANDLER
+        # AUTOREPLY
         # =================================================
 
         @self.client.on(events.NewMessage(incoming=True))
@@ -598,34 +589,54 @@ class AutoReply:
 
             try:
 
-                # =========================================
-                # SKIP SELF
-                # =========================================
-
                 if event.sender_id == self.userbot_id:
                     return
-
-                # =========================================
-                # ONLY GROUP
-                # =========================================
 
                 if not event.is_group:
                     return
 
-                chat_id = str(event.chat_id)
-
                 # =========================================
-                # CHECK TARGET
-                # =========================================
-
-                if chat_id not in self.autoreply_groups:
-                    return
-
-                # =========================================
-                # MUST FORWARDED CHANNEL POST
+                # HARUS FORWARDED POST
                 # =========================================
 
                 if not event.message.fwd_from:
+                    return
+
+                # =========================================
+                # AMBIL SOURCE CHANNEL
+                # =========================================
+
+                try:
+
+                    source_channel_id = str(
+                        event.message
+                        .fwd_from
+                        .from_id
+                        .channel_id
+                    ).replace("-100", "")
+
+                except:
+
+                    return
+
+                logger.info(
+                    f"[SOURCE CHANNEL] "
+                    f"{source_channel_id}"
+                )
+
+                # =========================================
+                # CHECK TARGET CHANNEL
+                # =========================================
+
+                if (
+                    source_channel_id
+                    not in self.target_channels
+                ):
+
+                    logger.info(
+                        "[SKIP] not target channel"
+                    )
+
                     return
 
                 # =========================================
@@ -640,7 +651,7 @@ class AutoReply:
                     return
 
                 logger.info(
-                    f"[MESSAGE] {msg_text[:150]}"
+                    f"[MESSAGE] {msg_text[:100]}"
                 )
 
                 uid = str(self.userbot_id)
@@ -650,13 +661,10 @@ class AutoReply:
                 matched_messages = []
 
                 # =========================================
-                # CHECK ALL WORDINGS
+                # CHECK WORDINGS
                 # =========================================
 
                 for wording in wordings:
-
-                    if not wording.get("active", True):
-                        continue
 
                     max_count = wording.get(
                         "jumlah",
@@ -697,7 +705,7 @@ class AutoReply:
                     )
 
                     msg_key = (
-                        f"{chat_id}:"
+                        f"{event.chat_id}:"
                         f"{event.id}:"
                         f"{wording['_id']}"
                     )
@@ -718,14 +726,7 @@ class AutoReply:
                     })
 
                 # =========================================
-                # NO MATCH
-                # =========================================
-
-                if not matched_messages:
-                    return
-
-                # =========================================
-                # SEND REPLY
+                # SEND REPLIES
                 # =========================================
 
                 for item in matched_messages:
@@ -741,8 +742,6 @@ class AutoReply:
                         f"{reply.id}"
                     )
 
-                    # anti duplicate
-
                     await self.db.replied_messages.insert_one(
                         {
                             "key": item["msg_key"],
@@ -750,9 +749,9 @@ class AutoReply:
                         }
                     )
 
-                    # increment
-
-                    new_count = item["sent_count"] + 1
+                    new_count = (
+                        item["sent_count"] + 1
+                    )
 
                     await self.db.wordings.update_one(
                         {
@@ -766,107 +765,6 @@ class AutoReply:
                     )
 
                     wording["send_count"] = new_count
-
-                    # =====================================
-                    # SAVE LINK
-                    # =====================================
-
-                    reply_chat_id = str(
-                        event.chat_id
-                    ).replace("-100", "")
-
-                    reply_link = (
-                        f"https://t.me/c/"
-                        f"{reply_chat_id}/"
-                        f"{reply.id}"
-                    )
-
-                    await self.db.reply_logs.insert_one(
-                        {
-                            "wording_id": str(wording["_id"]),
-                            "link": reply_link,
-                            "created_at": datetime.now()
-                        }
-                    )
-
-                    logger.info(
-                        f"[LINK SAVED] {reply_link}"
-                    )
-
-                    # =====================================
-                    # LIMIT REACHED
-                    # =====================================
-
-                    if (
-                        wording["jumlah"] > 0
-                        and
-                        new_count >= wording["jumlah"]
-                    ):
-
-                        logger.info(
-                            f"[LIMIT REACHED] "
-                            f"{wording['keyword']}"
-                        )
-
-                        logs = await self.db.reply_logs.find(
-                            {
-                                "wording_id": str(wording["_id"])
-                            }
-                        ).to_list(None)
-
-                        links = []
-
-                        for i, log in enumerate(
-                            logs,
-                            start=1
-                        ):
-
-                            links.append(
-                                f"{i}. {log['link']}"
-                            )
-
-                        bukti = "\n".join(links)
-
-                        report = (
-                            f"✅ <b>WORDING SELESAI</b>\n\n"
-                            f"🔑 Keyword:\n"
-                            f"<code>{wording['keyword']}</code>\n\n"
-                            f"💬 Pesan:\n"
-                            f"<code>{wording['message']}</code>\n\n"
-                            f"📦 Total Send:\n"
-                            f"<code>{new_count}</code>\n\n"
-                            f"🔗 Bukti:\n"
-                            f"{bukti}\n\n"
-                            f"Thank you for use my services :D"
-                        )
-
-                        await self.client.send_message(
-                            "me",
-                            report,
-                            link_preview=False
-                        )
-
-                        # delete wording
-
-                        await self.db.wordings.delete_one(
-                            {
-                                "_id": wording["_id"]
-                            }
-                        )
-
-                        if uid in self.wordings:
-
-                            self.wordings[uid] = [
-                                w
-                                for w in self.wordings[uid]
-                                if str(w["_id"])
-                                != str(wording["_id"])
-                            ]
-
-                        logger.info(
-                            f"[AUTO DELETE] "
-                            f"{wording['keyword']}"
-                        )
 
                     await asyncio.sleep(1)
 
