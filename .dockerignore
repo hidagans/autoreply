@@ -3,6 +3,4 @@ __pycache__
 *.pyc
 *.pyo
 *.pyd
-.env
 bot.log
-*.session
