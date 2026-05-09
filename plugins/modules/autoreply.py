@@ -766,6 +766,46 @@ class AutoReply:
 
                     wording["send_count"] = new_count
 
+                    # =========================================
+                    # SIMPAN BUKTI LINK
+                    # =========================================
+
+                    chat_id_str = str(
+                        event.chat_id
+                    ).replace("-100", "")
+
+                    bukti_link = (
+                        f"https://t.me/c/"
+                        f"{chat_id_str}/"
+                        f"{reply.id}"
+                    )
+
+                    await self.db.wording_bukti.insert_one(
+                        {
+                            "wording_id": str(
+                                wording["_id"]
+                            ),
+                            "userbot_id": self.userbot_id,
+                            "link": bukti_link,
+                            "created_at": datetime.now()
+                        }
+                    )
+
+                    # =========================================
+                    # CEK APAKAH LIMIT TERCAPAI
+                    # =========================================
+
+                    max_count = wording.get("jumlah", 0)
+
+                    if (
+                        max_count > 0
+                        and new_count >= max_count
+                    ):
+
+                        await self._send_completion_report(
+                            wording
+                        )
+
                     await asyncio.sleep(1)
 
                 elapsed = round(
@@ -784,6 +824,61 @@ class AutoReply:
                 logger.exception(
                     f"[FATAL ERROR] {e}"
                 )
+
+    # =====================================================
+    # COMPLETION REPORT
+    # =====================================================
+
+    async def _send_completion_report(self, wording):
+
+        try:
+
+            # Ambil semua bukti link dari DB
+            bukti_list = await self.db.wording_bukti.find(
+                {
+                    "wording_id": str(wording["_id"]),
+                    "userbot_id": self.userbot_id
+                }
+            ).sort("created_at", 1).to_list(None)
+
+            keywords = wording.get("keyword", "")
+            pesan = wording.get("message", "")
+            total = wording.get("jumlah", 0)
+
+            # Build bukti text
+            bukti_text = ""
+            for i, b in enumerate(bukti_list, start=1):
+                bukti_text += f"{i}. {b['link']}\n"
+
+            report = (
+                f"✅ <b>WORDING SELESAI</b>\n\n"
+                f"🔑 Keyword:\n"
+                f"<code>{keywords}</code>\n\n"
+                f"💬 Pesan:\n"
+                f"<code>{pesan}</code>\n\n"
+                f"📦 Total Send:\n"
+                f"<code>{total}</code>\n\n"
+                f"🔗 Bukti:\n"
+                f"{bukti_text}\n"
+                f"Thank you for use my services :D"
+            )
+
+            # Kirim ke Saved Messages (me)
+            await self.client.send_message(
+                "me",
+                report,
+                parse_mode="html"
+            )
+
+            logger.info(
+                f"[REPORT SENT] wording={wording['_id']}"
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                f"[REPORT ERROR] {e}"
+            )
 
     # =====================================================
     # START
