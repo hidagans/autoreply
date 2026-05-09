@@ -444,6 +444,43 @@ class AutoReply:
 
                 return
 
+            # =============================================
+            # HELP
+            # =============================================
+
+            if command == "help":
+
+                help_text = """
+<b>📖 COMMAND LIST</b>
+
+<b>GROUP TARGET</b>
+<code>/add_autoreply -100xxxx</code>
+<code>/del_autoreply -100xxxx</code>
+<code>/list_autoreply</code>
+
+<b>WORDING</b>
+<code>/addwording</code>
+<code>/list_wording</code>
+<code>/delwording nomor</code>
+
+<b>INTERACTIVE</b>
+<code>cancel</code> → batalkan input
+
+<b>INFO</b>
+• Auto reply khusus forwarded channel post
+• Bisa multi keyword
+• Bisa multi reply
+• Auto delete setelah limit
+• Auto report ke Saved Messages
+                """
+
+                await event.reply(
+                    help_text,
+                    parse_mode="html"
+                )
+
+                return
+
         # =================================================
         # INTERACTIVE HANDLER
         # =================================================
