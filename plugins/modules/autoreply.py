@@ -726,11 +726,10 @@ class AutoReply:
                     })
 
                 # =========================================
-                # SEND REPLIES
+                # SEND REPLIES - paralel tanpa sleep
                 # =========================================
 
-                for item in matched_messages:
-
+                async def process_reply(item):
                     wording = item["wording"]
 
                     reply = await event.reply(
@@ -742,34 +741,6 @@ class AutoReply:
                         f"{reply.id}"
                     )
 
-                    await self.db.replied_messages.insert_one(
-                        {
-                            "key": item["msg_key"],
-                            "created_at": datetime.now()
-                        }
-                    )
-
-                    new_count = (
-                        item["sent_count"] + 1
-                    )
-
-                    await self.db.wordings.update_one(
-                        {
-                            "_id": wording["_id"]
-                        },
-                        {
-                            "$set": {
-                                "send_count": new_count
-                            }
-                        }
-                    )
-
-                    wording["send_count"] = new_count
-
-                    # =========================================
-                    # SIMPAN BUKTI LINK
-                    # =========================================
-
                     chat_id_str = str(
                         event.chat_id
                     ).replace("-100", "")
@@ -780,33 +751,37 @@ class AutoReply:
                         f"{reply.id}"
                     )
 
-                    await self.db.wording_bukti.insert_one(
-                        {
-                            "wording_id": str(
-                                wording["_id"]
-                            ),
-                            "userbot_id": self.userbot_id,
-                            "link": bukti_link,
-                            "created_at": datetime.now()
-                        }
+                    new_count = item["sent_count"] + 1
+
+                    # DB ops paralel
+                    await asyncio.gather(
+                        self.db.replied_messages.insert_one(
+                            {"key": item["msg_key"], "created_at": datetime.now()}
+                        ),
+                        self.db.wordings.update_one(
+                            {"_id": wording["_id"]},
+                            {"$set": {"send_count": new_count}}
+                        ),
+                        self.db.wording_bukti.insert_one(
+                            {
+                                "wording_id": str(wording["_id"]),
+                                "userbot_id": self.userbot_id,
+                                "link": bukti_link,
+                                "created_at": datetime.now()
+                            }
+                        )
                     )
 
-                    # =========================================
-                    # CEK APAKAH LIMIT TERCAPAI
-                    # =========================================
+                    wording["send_count"] = new_count
 
                     max_count = wording.get("jumlah", 0)
+                    if max_count > 0 and new_count >= max_count:
+                        await self._send_completion_report(wording)
 
-                    if (
-                        max_count > 0
-                        and new_count >= max_count
-                    ):
-
-                        await self._send_completion_report(
-                            wording
-                        )
-
-                    await asyncio.sleep(1)
+                if matched_messages:
+                    await asyncio.gather(
+                        *[process_reply(item) for item in matched_messages]
+                    )
 
                 elapsed = round(
                     time.time() - start_time,
