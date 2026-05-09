@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    container_name: autoreply-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./userbot.session:/app/userbot.session
+      - ./bot.log:/app/bot.log
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  mongodb:
+    image: mongo:7
+    container_name: autoreply-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:
