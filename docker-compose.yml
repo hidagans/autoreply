@@ -8,8 +8,7 @@ services:
       - ./userbot.session:/app/userbot.session
       - ./bot.log:/app/bot.log
     depends_on:
-      mongodb:
-        condition: service_healthy
+      - mongodb
 
   mongodb:
     image: mongo:7
@@ -17,12 +16,6 @@ services:
     restart: unless-stopped
     volumes:
       - mongo_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
 
 volumes:
   mongo_data:
