@@ -1,0 +1,637 @@
+"""
+AutoReply Module for Telegram Userbot
+Fitur: monitoring discussion groups, auto-reply dengan wording custom
+"""
+
+import logging
+import os
+from typing import List, Dict
+from telethon import events
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+class AutoReply:
+    """Module untuk AutoReply Discussion Group"""
+
+    def __init__(self, client, db):
+        self.client = client
+        self.db = db
+        self.autoreply_groups = []
+        self.wordings = []
+
+        # Userbot info (initialized lazily)
+        self.userbot_id = None
+        self.userbot_username = None
+
+    async def _init_userbot_info(self):
+        """Initialize userbot info if not already set"""
+        if self.userbot_id is None:
+            try:
+                me = await self.client.get_me()
+                self.userbot_id = me.id
+                self.userbot_username = me.username
+                logger.info(f"Userbot initialized: ID={self.userbot_id}, username={self.userbot_username}")
+            except Exception as e:
+                logger.error(f"Failed to initialize userbot info: {e}")
+                self.userbot_id = None
+                self.userbot_username = None
+
+    async def load_config(self):
+        """Load config dari MongoDB"""
+        logger.info("Loading AutoReply config...")
+
+        # Load autoreply groups
+        groups = await self.db.autoreply_groups.find().to_list(None)
+        self.autoreply_groups = [str(g['group_id']) for g in groups]
+        logger.info(f"Loaded {len(self.autoreply_groups)} autoreply groups")
+
+        # Load wordings
+        wordings = await self.db.wordings.find().to_list(None)
+        self.wordings = [
+            {
+                'id': str(w['id']),
+                'send_count': w.get('send_count', 1),
+                'keyword': w.get('keyword', ''),
+                'message': w.get('message', ''),
+                'group_id': str(w.get('group_id', 'all'))
+            }
+            for w in wordings
+        ]
+        logger.info(f"Loaded {len(self.wordings)} wordings")
+
+    async def save_group(self, group_id: str):
+        """Simpan group ke database"""
+        try:
+            await self.db.autoreply_groups.update_one(
+                {'group_id': group_id},
+                {'$setOnInsert': {
+                    'group_id': group_id,
+                    'created_at': datetime.utcnow()
+                }},
+                upsert=True
+            )
+            if group_id not in self.autoreply_groups:
+                self.autoreply_groups.append(str(group_id))
+            return True
+        except Exception as e:
+            logger.error(f"Gagal save group: {e}")
+            return False
+
+    async def delete_group(self, group_id: str):
+        """Hapus group dari database"""
+        try:
+            await self.db.autoreply_groups.delete_one({'group_id': group_id})
+            if group_id in self.autoreply_groups:
+                self.autoreply_groups.remove(str(group_id))
+            return True
+        except Exception as e:
+            logger.error(f"Gagal delete group: {e}")
+            return False
+
+    async def save_wording(self, data: Dict):
+        """Simpan wording baru"""
+        try:
+            import uuid
+            data['id'] = str(uuid.uuid4())
+
+            result = await self.db.wordings.insert_one(data)
+
+            self.wordings.append({
+                'id': str(result.inserted_id),
+                'send_count': data.get('send_count', 1),
+                'keyword': data.get('keyword', ''),
+                'message': data.get('message', ''),
+                'group_id': data.get('group_id', 'all')
+            })
+            return True, str(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Gagal save wording: {e}")
+            return False, str(e)
+
+    async def delete_wording(self, wording_id: str):
+        """Hapus wording berdasarkan ID"""
+        try:
+            await self.db.wordings.delete_one({'id': wording_id})
+            self.wordings = [
+                w for w in self.wordings
+                if w['id'] != wording_id
+            ]
+            return True
+        except Exception as e:
+            logger.error(f"Gagal delete wording: {e}")
+            return False
+
+    async def list_wordings(self):
+        """List semua wording aktif"""
+        if not self.wordings:
+            return "Belum ada wording aktif."
+
+        result = []
+        for i, w in enumerate(self.wordings):
+            group_tag = w['group_id'] if w['group_id'] != 'all' else "All Groups"
+            result.append(
+                f"<code>{i+1}</code>. <b>Keyword:</b> <code>{w['keyword']}</b>\n"
+                f"   <b>Group:</b> {group_tag}\n"
+                f"   <b>Send Count:</b> {w['send_count']}\n"
+                f"   <b>Message:</b> {w['message'][:60]}..."
+            )
+
+        return "\n\n".join(result)
+
+    @staticmethod
+    def parse_arguments(args: str) -> Dict:
+        """Parse argument dari userbot command"""
+        parts = args.strip().split(maxsplit=1)
+        return {
+            'group_id': parts[0] if len(parts) > 0 else None,
+            'keyword': None,
+            'message': None,
+            'send_count': None
+        }
+
+    async def get_user_input_interactive(self, msg, update):
+        """Tanya input ke user secara interaktif"""
+        from telethon.tl.functions.messages import GetDialogsRequest
+
+        # Tanya jumlah pengiriman
+        await msg.respond("📦 <b>Berapa kali bot harus mengirim pesan auto-reply?</b>")
+        send_count = await self.get_text_input(update, msg)
+
+        # Tanya kata kunci
+        await msg.respond("🔑 <b>Masukkan kata kunci:</b>")
+        keyword = await self.get_text_input(update, msg)
+
+        # Tanya pesan auto-reply
+        await msg.respond("💬 <b>Pesan auto-reply:</b>")
+        message = await self.get_text_input(update, msg)
+
+        return {
+            'send_count': send_count,
+            'keyword': keyword,
+            'message': message
+        }
+
+    async def get_text_input(self, update, msg=None):
+        """Get text input dari user"""
+        update_text = update.message.text if update.message else ""
+        if update_text.startswith("/") and msg:
+            # Ambil text dari pesan terakhir
+            return msg.text
+        return update_text
+
+    async def send_link_to_saved_messages(self, client, message_id: int, channel_id: str, msg: str):
+        """Kirim link ke Saved Messages"""
+        try:
+            from telethon.tl.functions.messages import GetHistoryRequest
+            from telethon.tl.tl_schema import TL
+
+            link = f"https://t.me/c/{channel_id}/{message_id}"
+
+            # Send link ke Saved Messages
+            try:
+                # Cari saved messages dialog
+                dialogs = await self.client.get_dialogs()
+                saved_dialogs = [d for d in dialogs if d.is_user and d.entity.id == self.client.user_id]
+
+                if saved_dialogs:
+                    saved_msg = saved_dialogs[0]
+                    link_text = f"🔗 <b>Link Pesan Auto-Reply:</b>\n{link}\n\n<b>Original Message:</b>\n{msg[:500]}"
+                    await self.client.send_message(saved_msg.entity, link_text)
+                else:
+                    link_text = f"🔗 <b>Link Pesan Auto-Reply:</b>\n{link}\n\n<b>Original Message:</b>\n{msg[:500]}"
+                    await self.client.send_message("me", link_text)
+
+            except Exception as e:
+                # Fallback: kirim ke 'me' (saved messages) directly
+                link_text = f"🔗 <b>Link Pesan Auto-Reply:</b>\n{link}\n\n<b>Original Message:</b>\n{msg[:500]}"
+                await self.client.send_message("me", link_text)
+
+            logger.info(f"Link dikirim ke Saved Messages: {link}")
+            return True
+        except Exception as e:
+            logger.error(f"Gagal kirim ke Saved Messages: {e}")
+            return False
+
+    async def monitor_and_reply(self, message):
+        """Monitor pesan dan kirim auto-reply"""
+        if message.sender_id is None:  # Ignore bot messages
+            return
+
+        try:
+            message_text = message.message or ""
+
+            # Cari matching wording
+            for wording in self.wordings:
+                keyword = wording.get('keyword', '').lower()
+                if keyword and keyword in message_text.lower():
+                    # Cek group match
+                    if wording['group_id'] != 'all':
+                        if str(message.chat_id) != str(wording['group_id']):
+                            continue
+
+                    # Kirim auto-reply
+                    channel_id = str(message.chat_id)
+
+                    reply_count = int(wording.get('send_count', 1))
+                    for i in range(reply_count):
+                        try:
+                            await self.client.send_message(message.chat_id, wording['message'])
+                            await asyncio.sleep(5)  # Delay antar reply
+
+                            # Kirim link ke Saved Messages setelah reply pertama
+                            if i == 0:
+                                await self.send_link_to_saved_messages(self.client, message.id, channel_id, message_text)
+
+                            logger.info(f"Auto-reply dikirim ke group {channel_id}")
+                        except Exception as e:
+                            logger.error(f"Gagal kirim reply: {e}")
+                            break
+                    break  # Hanya reply dengan satu wording (bisa expand ke multiple)
+        except Exception as e:
+            logger.error(f"Error dalam monitor_and_reply: {e}")
+            pass
+
+    async def setup_handlers(self):
+        """Setup event handlers"""
+        # Event untuk memonitor pesan
+        @self.client.on(events.NewMessage(incoming=True))
+        async def handle_new_message(event):
+            logger.info(f"📩 New message received: {event.message.text[:100]} from {event.chat_id}")
+            try:
+                message_text = event.message.message or ""
+                logger.info(f"Message text: {message_text}")
+
+                # Check untuk command manual
+                if message_text.startswith('/') or message_text.startswith('!'):
+                    logger.info(f"Command detected: {message_text}")
+
+                    # Command broadcast ke semua grup
+                    if message_text.startswith(('/help_broadcast', '!help_broadcast')):
+                        logger.info(f"Help broadcast triggered from {event.chat_id}")
+                        help_text = """
+<b>『 AutoReply Bot Help 』</b>
+
+   <b>•</b> <code>/add_autoreply group_id</code> - Tambah group ke daftar
+
+   <b>•</b> <code>/del_autoreply group_id</code> - Hapus group
+
+   <b>•</b> <code>/addwording</code> - Tambah wording
+
+   <b>•</b> <code>/delwording nomor</code> - Hapus wording
+
+   <b>•</b> <code>/list_wording</code> - Lihat semua wording
+
+   <b>•</b> <code>/help_broadcast</code> - Broadcast help ke semua grup
+"""
+                        try:
+                            await self.client.send_message(event.chat_id, help_text)
+                            await event.reply(f"✅ <b>Help dikirim ke chat ini.</b>")
+                        except Exception as e:
+                            logger.error(f"Gagal kirim broadcast: {e}")
+                            await event.reply(f"❌ <b>Gagal kirim pesan:</b> {e}")
+                        return
+
+                    # Command help ke Saved Messages
+                    if message_text in ['/help', '!help']:
+                        help_text = """
+<b>『 AutoReply Bot Help 』</b>
+
+   <b>•</b> <code>/add_autoreply group_id</code> - Tambah group ke daftar
+
+   <b>•</b> <code>/del_autoreply group_id</code> - Hapus group
+
+   <b>•</b> <code>/addwording</code> - Tambah wording
+
+   <b>•</b> <code>/delwording nomor</code> - Hapus wording
+
+   <b>•</b> <code>/list_wording</code> - Lihat semua wording
+
+   <b>•</b> <code>/help_broadcast</code> - Broadcast help ke semua grup
+"""
+                        try:
+                            await self.client.send_message("me", help_text)
+                            await event.reply("✅ <b>Help dikirim ke Saved Messages.</b>")
+                        except Exception as e:
+                            logger.error(f"Gagal kirim help ke Saved Messages: {e}")
+                            await event.reply(f"❌ <b>Gagal kirim pesan:</b> {e}")
+                        return
+
+                    # ... command lain
+
+                # Cek keyword matching untuk auto-reply
+                for wording in self.wordings:
+                    keyword = wording.get('keyword', '').lower()
+                    if keyword and keyword in message_text.lower():
+                        logger.info(f"Keyword match! {keyword}")
+                        # ... kirim auto-reply
+                        break
+
+            except Exception as e:
+                logger.error(f"Error in handle_new_message: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+        # Command handler (hanya userbot sendiri bisa masuk)
+        @self.client.on(events.NewMessage(pattern=r'^([\/!])(add_autoreply|del_autoreply|addwording|delwording|list_wording|help|help_broadcast)\b'))
+        async def handle_command(event):
+            # Cek apakah ini dari userbot sendiri
+            # Saved Messages: event.chat_id === 'me'
+            # Grup/Channel: sender_id === userbot_id
+
+            # Initialize userbot info if not set
+            if self.userbot_id is None:
+                await self._init_userbot_info()
+
+            # Cek Saved Messages dulu
+            if event.chat_id == 'me':
+                logger.info(f"✅ Command from Saved Messages (allowed)")
+            else:
+                # Grup/Channel: cek sender_id
+                sender_id = event.message.sender_id
+                logger.info(f"Cek sender ID: {sender_id}, Chat ID: {event.chat_id}, Userbot ID: {self.userbot_id}")
+
+            if self.userbot_id is None or sender_id != self.userbot_id:
+                logger.info(f"Ignoring command from non-userbot: {sender_id}")
+                return
+
+            # Get message text
+            message_text = event.message.message or ""
+
+            # Parse command and arguments
+            # Format: /command arg1 arg2...
+
+            # Command broadcast
+            if message_text in ['/help_broadcast', '!help_broadcast']:
+                try:
+                    help_text = """
+<b>『 AutoReply Bot Help 』</b>
+
+   <b>•</b> <code>/add_autoreply group_id</code> - Tambah group ke daftar
+
+   <b>•</b> <code>/del_autoreply group_id</code> - Hapus group
+
+   <b>•</b> <code>/addwording</code> - Tambah wording
+
+   <b>•</b> <code>/delwording nomor</code> - Hapus wording
+
+   <b>•</b> <code>/list_wording</code> - Lihat semua wording
+
+   <b>•</b> <code>/help</code> - Tampilkan bantuan
+"""
+                    # Tampilkan ke chat yang command dikirim
+                    await event.reply(f"✅ <b>Help:</b>\n\n{help_text}")
+                except Exception as e:
+                    logger.error(f"Gagal kirim broadcast: {e}")
+                    await event.reply(f"❌ <b>Gagal kirim pesan:</b> {e}")
+                return
+
+            # Command help ke Saved Messages
+            if message_text in ['/help', '!help']:
+                try:
+                    help_text = """
+<b>『 AutoReply Bot Help 』</b>
+
+   <b>•</b> <code>/add_autoreply group_id</code> - Tambah group ke daftar
+
+   <b>•</b> <code>/del_autoreply group_id</code> - Hapus group
+
+   <b>•</b> <code>/addwording</code> - Tambah wording
+
+   <b>•</b> <code>/delwording nomor</code> - Hapus wording
+
+   <b>•</b> <code>/list_wording</code> - Lihat semua wording
+
+   <b>•</b> <code>/help</code> - Tampilkan bantuan
+"""
+                    # Kirim ke Saved Messages
+                    await self.client.send_message("me", help_text)
+
+                    # Reply ke sender userbot
+                    try:
+                        await event.reply("✅ <b>Help dikirim ke Saved Messages.</b>")
+                    except Exception as reply_error:
+                        logger.error(f"Gagal reply ke sender: {reply_error}")
+                        # Fallback: kirim balasan ke "me" juga
+                        try:
+                            await self.client.send_message("me", f"✅ Berhasil mengirim help.\n\nUserbot: Fasya ($55)")
+                        except Exception as fallback_error:
+                            logger.error(f"Gagal fallback ke Saved Messages: {fallback_error}")
+                except Exception as e:
+                    logger.error(f"Gagal kirim help ke Saved Messages: {e}")
+                    await event.reply(f"❌ <b>Gagal kirim pesan:</b> {e}")
+                return
+
+            # Parse command (remove / or ! prefix)
+            if message_text.startswith('/') or message_text.startswith('!'):
+                # Get base command (first word only)
+                base_command = message_text[1:].split()[0]
+                args = message_text[len(base_command)+2:]
+
+                # Command add_autoreply
+                if base_command == 'add_autoreply':
+                    if not args.strip():
+                        await event.reply("Masukkan group_id. Misalnya: <code>/add_autoreply -1001234567890</code>")
+                    else:
+                        group_id = args.strip()
+                        success = await self.save_group(group_id)
+                        if success:
+                            await event.reply(f"✅ <b>Group ditambahkan:</b> <code>{group_id}</code>")
+                        else:
+                            await event.reply("❌ <b>Gagal menambahkan group.</b>")
+                    return
+
+                # Command del_autoreply
+                if base_command == 'del_autoreply':
+                    if not args.strip():
+                        await event.reply("Masukkan group_id. Misalnya: <code>/del_autoreply -1001234567890</code>")
+                    else:
+                        group_id = args.strip()
+                        success = await self.delete_group(group_id)
+                        if success:
+                            await event.reply(f"✅ <b>Group dihapus:</b> <code>{group_id}</code>")
+                        else:
+                            await event.reply("❌ <b>Gagal menghapus group.</b>")
+                    return
+
+                # Command list_wording
+                if base_command == 'list_wording':
+                    result = await self.list_wordings()
+                    await event.reply(result)
+                    return
+
+                # Command delwording
+                if base_command == 'delwording':
+                    if not args.strip():
+                        await event.reply("Masukkan nomor wording. Misalnya: <code>/delwording 1</code>\nGunakan <code>/list_wording</code> untuk melihat nomor.")
+                    else:
+                        try:
+                            num = int(args.strip())
+                            if num < 1 or num > len(self.wordings):
+                                await event.reply(f"❌ <b>Nomor tidak valid.</b> Gunakan nomor antara 1-{len(self.wordings)}.")
+                                return
+
+                            wording = self.wordings[num - 1]
+                            success = await self.delete_wording(wording['id'])
+
+                            if success:
+                                await event.reply(f"✅ <b>Wording dihapus:</b> <code>{wording['keyword']}</code>")
+                            else:
+                                await event.reply("❌ <b>Gagal menghapus wording.</b>")
+                        except ValueError:
+                            await event.reply("❌ <b>Syntax error.</b> Gunakan format: <code>/delwording <b>nomor</b></code>")
+                    return
+
+            # Command addwording
+            if base_command == 'addwording':
+                await event.reply("💬 Kirim wording dengan format:\n\n<code>/addwording keyword|message</code>\n\nContoh:\n<code>/addwording halo|Halo! Ada yang bisa dibantu?</code>")
+                return
+
+            # Command addwording masih belum support via command manual, harus manual input
+        @self.client.on(events.NewMessage)
+        async def handle_input(event):
+            if event.message.reply_to:
+                update_msg = event.message
+                # Logic untuk get user input bisa ditambahkan
+
+    async def cmd_help(self, event):
+        """Command: help"""
+        try:
+            help_text = """
+<b>『 AutoReply Bot Help 』</b>
+
+<b>Perintah Admin:</b>
+
+   <b>•</b> <code>/add_autoreply group_id</code> - Tambah group ke daftar
+
+   <b>•</b> <code>/del_autoreply group_id</code> - Hapus group
+
+   <b>•</b> <code>/addwording</code> - Tambah wording (auto-reply)
+
+   <b>•</b> <code>/delwording nomor</code> - Hapus wording
+
+   <b>•</b> <code>/list_wording</code> - Lihat semua wording
+
+   <b>•</b> <code>/help</code> - Tampilkan bantuan ini
+
+   <b>•</b> <code>/help_broadcast</code> - Kirim help ke semua grup yang terdaftar
+
+<b>Auto-Reply Features:</b>
+- Bot monitor pesan di grup yang terdaftar
+- Auto-reply kalau ada kata kunci match
+- Kirim link ke Saved Messages setelah reply
+- Bisa setting jumlah pengiriman
+"""
+            # Try to send to "me" (Saved Messages)
+            try:
+                await self.client.send_message("me", help_text)
+                await event.reply("✅ <b>Help dikirim ke Saved Messages.</b>")
+            except Exception as e:
+                # If not allowed to send to Saved Messages, broadcast to groups
+                if self.autoreply_groups:
+                    await event.reply(f"⚠️ <b>Gagal kirim ke Saved Messages:</b> {e}\n\n<b>Mengirim ke {len(self.autoreply_groups)} grup terdaftar...</b>")
+                    for group_id in self.autoreply_groups:
+                        try:
+                            await self.client.send_message(group_id, help_text)
+                        except Exception as group_error:
+                            logger.error(f"Gagal kirim ke {group_id}: {group_error}")
+                    await event.reply(f"✅ <b>Help dikirim ke {len(self.autoreply_groups)} grup.</b>")
+                else:
+                    await event.reply(f"❌ <b>Gagal kirim ke Saved Messages:</b> {e}")
+        except Exception as e:
+            await event.reply(f"❌ <b>Error:</b> {e}")
+
+    async def cmd_add_autoreply(self, event, args: str):
+        """Command: add_autoreply group_id"""
+        try:
+            if not args.strip():
+                await event.reply("Masukkan group_id. Gunakan /get_dialogs untuk melihat daftar dialog.")
+                return
+
+            group_id = args.strip()
+            success = await self.save_group(group_id)
+
+            if success:
+                await event.reply(f"✅ <b>Group ditambahkan:</b> <code>{group_id}</code>")
+            else:
+                await event.reply("❌ <b>Gagal menambahkan group.</b>")
+        except Exception as e:
+            await event.reply(f"❌ <b>Error:</b> {e}")
+
+    async def cmd_del_autoreply(self, event, args: str):
+        """Command: del_autoreply group_id"""
+        try:
+            if not args.strip():
+                await event.reply("Masukkan group_id.")
+                return
+
+            group_id = args.strip()
+            success = await self.delete_group(group_id)
+
+            if success:
+                await event.reply(f"✅ <b>Group dihapus:</b> <code>{group_id}</code>")
+            else:
+                await event.reply("❌ <b>Gagal menghapus group.</b>")
+        except Exception as e:
+            await event.reply(f"❌ <b>Error:</b> {e}")
+
+    async def cmd_addwording(self, event, args: str):
+        """Command: addwording"""
+        try:
+            if not args.strip():
+                # Start input interaktif
+                await event.reply("<b>Mulai setup wording baru...</b>\n\n" +
+                                   "📦 <b>Berapa kali bot mengirim?</b>\n" +
+                                   "Key word: ")
+                return
+
+        except Exception as e:
+            await event.reply(f"❌ <b>Error:</b> {e}")
+
+    async def cmd_delwording(self, event, args: str):
+        """Command: delwording nomor"""
+        try:
+            if not args.strip():
+                await event.reply("Masukkan nomor wording yang ingin dihapus.\nGunakan /list_wording untuk melihat nomor.")
+                return
+
+            try:
+                # Parse nomor
+                num = int(args.strip())
+                if num < 1 or num > len(self.wordings):
+                    await event.reply(f"❌ <b>Nomor tidak valid.</b> Gunakan nomor antara 1-{len(self.wordings)}.")
+                    return
+
+                # Ambil wording
+                wording = self.wordings[num - 1]
+                success = await self.delete_wording(wording['id'])
+
+                if success:
+                    await event.reply(f"✅ <b>Wording dihapus:</b> <code>{wording['keyword']}</code>")
+                else:
+                    await event.reply("❌ <b>Gagal menghapus wording.</b>")
+            except ValueError:
+                await event.reply("❌ <b>Syntax error.</b> Gunakan format: /delwording <b>nomor</b>")
+        except Exception as e:
+            await event.reply(f"❌ <b>Error:</b> {e}")
+
+    async def cmd_list_wording(self, event):
+        """Command: list_wording"""
+        try:
+            result = await self.list_wordings()
+
+            if isinstance(result, str) and "Belum ada" in result:
+                await event.reply(result)
+            else:
+                help_text = """
+<b>📊 Daftar Wording Aktif</b>
+"""
+                await event.reply(help_text + result)
+        except Exception as e:
+            await event.reply(f"❌ <b>Error:</b> {e}")
+
+        logger.info("Command executed: {}".format(command))
+                # Logic yang bisa dilanjutkan...
