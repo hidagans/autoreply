@@ -874,6 +874,30 @@ class AutoReply:
                 f"[REPORT SENT] wording={wording['_id']}"
             )
 
+            # Delete wording + bukti dari DB
+            await self.db.wordings.delete_one(
+                {"_id": wording["_id"]}
+            )
+
+            await self.db.wording_bukti.delete_many(
+                {
+                    "wording_id": str(wording["_id"]),
+                    "userbot_id": self.userbot_id
+                }
+            )
+
+            # Hapus dari memory
+            uid = str(self.userbot_id)
+            if uid in self.wordings:
+                self.wordings[uid] = [
+                    w for w in self.wordings[uid]
+                    if str(w["_id"]) != str(wording["_id"])
+                ]
+
+            logger.info(
+                f"[WORDING DELETED] {wording['_id']}"
+            )
+
         except Exception as e:
 
             logger.exception(
